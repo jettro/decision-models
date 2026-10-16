@@ -7,6 +7,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "logfire>=5.2.0",
     "ollama>=0.6.3",
     "openai>=3.31.0",
     "pydantic-ai>=2.57.0",
