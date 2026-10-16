@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict
 from pydantic_ai import Agent, UseEnumMemberDocstrings
 from pydantic_ai.models.fallback import FallbackModel
 
+from decision_models.priority import assess_priority
 from decision_models.system_one import build_system_one_model
 
 
@@ -103,6 +104,16 @@ def print_classification(message: str, result) -> None:
         distribution = format_distribution(type(value), probabilities.get(field))
         if distribution:
             print(f'  {"":<12}   {distribution}')
+
+    assessment = assess_priority(output.urgency, output.impact, details)
+    line = f'  {"Priority:":<12} {assessment.priority.name:<11} (urgency {assessment.urgency.name}, impact {assessment.impact.name})'
+    if assessment.priority != assessment.baseline:
+        line += f', was {assessment.baseline.name} without escalation'
+    print(line)
+    if assessment.needs_review:
+        print(f'  {"":<12} NEEDS REVIEW by a person')
+    for reason in assessment.reasons:
+        print(f'  {"":<12}   - {reason}')
     print()
 
 

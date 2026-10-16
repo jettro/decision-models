@@ -326,4 +326,78 @@ What this means:
 - The confidence tells you how much to trust the level: 0.43 for the unsubscribe urgency means the model is torn between MEDIUM and HIGH.
 - Whether this is right depends on the question. For "how bad is it", the mean is a fair summary. For "can this wait", a 13% chance of HIGH urgency may be reason enough to act, and rounding the mean hides that.
 
+### Fix: escalate on risk and gate on confidence when computing the priority
+
+The options I considered:
+1. Escalate a level when the chance of a higher level is real.
+2. Compute an expected priority from the full urgency × impact distributions.
+3. Use the confidence as a gate: send unsure answers to a person.
+4. Pick the most likely level instead of rounding the score.
+5. Make urgency and impact pick-one questions (`StrEnum`).
+6. Improve the rubric descriptions.
+
+The choice: **1 and 3, in the priority calculation**. Why:
+- **Keep Pydantic AI's level as the baseline.** Rounding the score is a sound default for a rubric. Options 4 and 5 replace it and lose the ordering: with LOW 0.51 and CRITICAL 0.49, "most likely" says LOW.
+- **Priority is where the cost lives.** For a support desk, missing an urgent message costs more than over-prioritising one. That asymmetry belongs in our code, not in the model, so the rule goes into the priority step, next to the urgency × impact combination.
+- **Explainable.** "If there's at least a 30% chance it is HIGH or worse, treat it as HIGH" and "if the model is less than 30% sure, ask a person" are rules you can tell a support team. Every escalation prints its reason.
+- **No extra calls.** Both rules only use what is already in `result.response.provider_details` (`probabilities` and `confidence`).
+- **Why not 2 (yet).** An expected priority is mathematically nicer, but it gives a number like 2.37, which you then have to map back to a priority. It is harder to explain and adds little over 1 for now. Option 6 is still worth doing next to this, because sharper descriptions give sharper distributions.
+
+How it works (`src/decision_models/priority.py`):
+- **Escalate:** walk from the highest level down to the level Pydantic AI picked, adding up the probabilities. The first level where "this level or higher" reaches `0.3` becomes the new level. It never lowers a level.
+- **Priority:** urgency (0-3) + impact (0-2): 4 or more is `P1`, 3 is `P2`, 2 is `P3`, lower is `P4`. The priority is computed both with and without escalation, so you can see what the rule changed.
+- **Review:** if the confidence of urgency or impact is below `0.3`, the message is flagged for a person.
+
+```python
+def escalate[LevelT: IntEnum](level: LevelT, probabilities: Mapping[str, float] | None, threshold: float) -> LevelT:
+    if not probabilities:
+        return level
+    tail = 0.0
+    for candidate in sorted(type(level), reverse=True):
+        if candidate <= level:
+            break
+        tail += probabilities.get(str(candidate.value), 0.0)
+        if tail >= threshold:
+            return candidate
+    return level
+```
+
+In `main_advanced.py`, after the decision model has answered:
+
+```python
+assessment = assess_priority(output.urgency, output.impact, result.response.provider_details)
+```
+
+Result with `nimble`:
+
+```text
+  Message:     "I have been trying to generate an image 10 times, but I keep being logged out."
+  Priority:    P2          (urgency MEDIUM, impact HIGH), was P3 without escalation
+               NEEDS REVIEW by a person
+                 - impact MEDIUM -> HIGH: P(HIGH or higher) >= 0.30
+                 - impact confidence 0.29 < 0.30
+  Message:     "I need to pay for my dinner, but apple pay is failing and I do not have money."
+  Priority:    P1          (urgency HIGH, impact HIGH), was P3 without escalation
+               NEEDS REVIEW by a person
+                 - urgency MEDIUM -> HIGH: P(HIGH or higher) >= 0.30
+                 - impact MEDIUM -> HIGH: P(HIGH or higher) >= 0.30
+                 - impact confidence 0.28 < 0.30
+  Message:     "I noticed an advertorial and I would like to have more information on your offer."
+  Priority:    P4          (urgency MEDIUM, impact LOW)
+  Message:     "I am done with everything you offer. I want to unsubscribe and you need to delete my account."
+  Priority:    P1          (urgency HIGH, impact HIGH), was P2 without escalation
+                 - urgency MEDIUM -> HIGH: P(HIGH or higher) >= 0.30
+  Message:     "I love what you are doing, please continue and allow me to help."
+  Priority:    P4          (urgency LOW, impact LOW)
+  Message:     "Tell be how I can logout from the app."
+  Priority:    P3          (urgency MEDIUM, impact MEDIUM)
+               NEEDS REVIEW by a person
+                 - impact confidence 0.04 < 0.30
+```
+
+What I learned:
+- Escalation does what it should: the person who can't pay for dinner goes from `P3` to `P1`, the unsubscribe from `P2` to `P1`. The compliment and the advertorial question stay low.
+- The thresholds need calibrating. With a review bar of `0.5`, five of the six messages were flagged, because `nimble`'s rubric confidences are low in general (often 0.3-0.45). A flag that is always on is useless, so I lowered it to `0.3`. Pick these numbers from a labelled set of real messages, not from six examples.
+- The priority is computed in plain Python after the decision. It is not (yet) a tool the agent calls: the decision model supplies the probabilities, our code makes the call.
+
 
