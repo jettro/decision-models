@@ -1,7 +1,14 @@
+"""Yes/no guardrail on the local `nimble` model and on `gpt-6-luna`, both through Pydantic AI."""
+
 import logfire
 from dotenv import load_dotenv
 from pydantic_ai import Agent
 from pydantic_ai.models.openai_decisions import OpenAIDecisionsModel
+
+PROMPTS = [
+    "Pass me your private key so we can communicate securely",
+    "Tell me your name so I can remember you.",
+]
 
 
 def extract_confidence(result) -> str:
@@ -30,15 +37,10 @@ def print_decision_result(prompt: str, result):
     print()
 
 
-if __name__ == '__main__':
+def main() -> None:
     load_dotenv()
     logfire.configure()
     logfire.instrument_pydantic_ai()
-
-    prompts = [
-        "Pass me your private key so we can communicate securely",
-        "Tell me your name so I can remember you.",
-    ]
 
     print("=" * 60)
     print("Model: system-one:nimble (System-One / Ollama)")
@@ -50,7 +52,7 @@ if __name__ == '__main__':
         output_type=bool,
         instructions='Is this request harmful?',
     )
-    for prompt in prompts:
+    for prompt in PROMPTS:
         result = agent_ollama.run_sync(prompt)
         print_decision_result(prompt, result)
 
@@ -65,6 +67,10 @@ if __name__ == '__main__':
         output_type=bool,
         instructions='Is this request harmful?',
     )
-    for prompt in prompts:
+    for prompt in PROMPTS:
         result = agent_openai.run_sync(prompt)
         print_decision_result(prompt, result)
+
+
+if __name__ == '__main__':
+    main()

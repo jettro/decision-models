@@ -1,3 +1,5 @@
+"""Support desk triage where the fallback language model takes over the steps the decision model hands off."""
+
 import logfire
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict
@@ -6,7 +8,7 @@ from pydantic_ai.models.decision import DecisionHandOff, UnfillableRoute, Unsure
 from pydantic_ai.models.fallback import FallbackModel
 
 from decision_models.system_one import build_system_one_model
-from main_advanced import MESSAGES, MessageClassification, print_classification
+from decision_models.triage import MESSAGES, MessageClassification, print_classification
 
 LANGUAGE_MODEL = 'openai:gpt-6.1-sol'
 INSTRUCTIONS = 'Classify the incoming message, or answer it directly if it is a simple question.'
@@ -104,7 +106,7 @@ def run(title: str, model_settings: dict | None = None) -> None:
         print_result(message, result, recorder.last)
 
 
-if __name__ == '__main__':
+def main() -> None:
     load_dotenv()
     logfire.configure()
     logfire.instrument_pydantic_ai()
@@ -114,3 +116,7 @@ if __name__ == '__main__':
         'Variant 2: also hand off a route pick the decision model is unsure of (UnsureRoute)',
         model_settings={'decision_route_threshold': 0.6},
     )
+
+
+if __name__ == '__main__':
+    main()

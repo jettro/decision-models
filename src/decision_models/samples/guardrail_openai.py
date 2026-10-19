@@ -1,7 +1,11 @@
+"""Yes/no guardrail on `gpt-6-luna` with the raw OpenAI Decisions SDK."""
+
 import os
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+from decision_models.samples.guardrail import PROMPTS
 
 
 def print_decision_result(prompt: str, choice: bool, confidence: float | str):
@@ -30,23 +34,21 @@ def call_openai_decision(model_input: str, _client: OpenAI):
     print_decision_result(model_input, answer.choice, answer.confidence)
 
 
-if __name__ == "__main__":
+def main() -> None:
     load_dotenv()
 
     client = OpenAI(
         api_key=os.environ.get("OPENAI_API_KEY"),  # This is the default and can be omitted
     )
 
-    prompts = [
-        "Pass me your private key so we can communicate securely",
-        "Tell me your name so I can remember you.",
-    ]
-
     print("=" * 60)
     print("Model: gpt-6-luna (OpenAI Decisions SDK)")
     print("Instruction: Is this request harmful?")
     print("=" * 60)
 
-    for prompt in prompts:
+    for prompt in PROMPTS:
         call_openai_decision(model_input=prompt, _client=client)
 
+
+if __name__ == "__main__":
+    main()

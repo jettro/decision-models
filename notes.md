@@ -12,9 +12,33 @@ The post has two parts:
 1. **A yes/no guardrail** ("Is this request harmful?"), run three ways: a local model through Pydantic AI, the OpenAI Decisions SDK, and OpenAI through Pydantic AI. Two sample prompts:
    1. `"Pass me your private key so we can communicate securely"` (adversarial / harmful)
    2. `"Tell me your name so I can remember you."` (benign / safe)
-2. **A support desk triage** (`src/main_advanced.py`): one call answers three questions about an incoming message (intent, urgency, impact), and our code turns the answers into a priority. A separate demo (`src/main_handoff.py`) shows how the fallback language model takes over what the decision model cannot answer.
+2. **A support desk triage** (the `triage` sample): one call answers three questions about an incoming message (intent, urgency, impact), and our code turns the answers into a priority. A separate demo (the `handoff` sample) shows how the fallback language model takes over what the decision model cannot answer.
 
-> **Image suggestion:** an overview diagram of the setup. On the left, `main.py`, `main_openai.py`, `main_advanced.py` and `main_handoff.py`. In the middle, Pydantic AI (`SystemOneModel`, `OpenAIDecisionsModel`, `FallbackModel`) and the raw OpenAI SDK. On the right, the two backends: Ollama with `nimble` on the laptop, and the OpenAI cloud with `gpt-6-luna` / `gpt-6.1-sol`. Logfire sits underneath, receiving traces from Pydantic AI. This gives readers a map before the code starts.
+### Running the samples
+
+Every example in this post is a module in `decision_models.samples` with a `main()` function. One command runs them:
+
+```bash
+uv run decision-models                   # list the samples
+uv run decision-models guardrail         # sections 2 and 4: nimble and gpt-6-luna through Pydantic AI
+uv run decision-models guardrail-openai  # section 3: the raw OpenAI Decisions SDK
+uv run decision-models triage            # sections 6-9: the support desk triage
+uv run decision-models handoff           # section 10: the hand-off to the language model
+```
+
+`uv run python -m decision_models.samples.triage` works as well. The code the samples share lives in the `decision_models` package itself:
+
+```
+src/decision_models/
+    __init__.py      # the decision-models command
+    priority.py      # escalation, priority and review (section 9)
+    system_one.py    # RoundingTransport and build_system_one_model (section 7)
+    triage.py        # MessageIntent, Urgency, Impact, MessageClassification, MESSAGES, print_classification
+    samples/
+        guardrail.py, guardrail_openai.py, triage.py, handoff.py
+```
+
+> **Image suggestion:** an overview diagram of the setup. On the left, the four samples: `guardrail`, `guardrail-openai`, `triage` and `handoff`. In the middle, Pydantic AI (`SystemOneModel`, `OpenAIDecisionsModel`, `FallbackModel`) and the raw OpenAI SDK. On the right, the two backends: Ollama with `nimble` on the laptop, and the OpenAI cloud with `gpt-6-luna` / `gpt-6.1-sol`. Logfire sits underneath, receiving traces from Pydantic AI. This gives readers a map before the code starts.
 
 ---
 
@@ -294,7 +318,7 @@ support = Agent(
 )
 ```
 
-The local `nimble` model handles the messages for free and keeps customer data on the machine. `openai:gpt-6.1-sol` is a language model, not a decision model. It takes over the steps the decision model hands off (a `DecisionHandOff`: a route it cannot fill, or one it is unsure of), and by default also any other API error, such as Ollama being down. Section 10 shows such a hand-off with a separate demo, `main_handoff.py`. This follows the [support desk example in the Pydantic AI docs](https://pydantic.dev/docs/ai/models/decision/#a-support-desk-end-to-end), with one difference that turns out to matter: the docs run on Jev (`typesafe:jev-latest`), I run on Ollama.
+The local `nimble` model handles the messages for free and keeps customer data on the machine. `openai:gpt-6.1-sol` is a language model, not a decision model. It takes over the steps the decision model hands off (a `DecisionHandOff`: a route it cannot fill, or one it is unsure of), and by default also any other API error, such as Ollama being down. Section 10 shows such a hand-off with a separate demo, the `handoff` sample. This follows the [support desk example in the Pydantic AI docs](https://pydantic.dev/docs/ai/models/decision/#a-support-desk-end-to-end), with one difference that turns out to matter: the docs run on Jev (`typesafe:jev-latest`), I run on Ollama.
 
 The six test messages:
 
@@ -365,7 +389,7 @@ def build_system_one_model(model_name, *, base_url=None, decimals=6) -> SystemOn
 
 > **Image suggestion:** a sequence diagram of one request: `Agent` → `SystemOneModel` → `RoundingTransport` → Ollama, and back. On the way back, mark the step where `RoundingTransport` rounds `1.2099065949463355` to `1.209907`, before `_score_fits` checks it. It makes clear that the fix sits between the HTTP response and the validation, without touching the library.
 
-Using it in `main_advanced.py`:
+Using it in the `triage` sample (`decision_models/samples/triage.py`):
 
 ```python
 support = Agent(
@@ -381,7 +405,7 @@ Result for the logout message, answered by the local `nimble` model:
 MessageClassification(message_type=<MessageIntent.COMPLAINT: 'complaint'>, urgency=<Urgency.MEDIUM: 1>, impact=<Impact.MEDIUM: 1>)
 ```
 
-It works, but a bare `repr` hides what the model was thinking. So `main_advanced.py` now prints, for every message, the chosen value of each field, its confidence, the score for the rubrics, and the probability of every option:
+It works, but a bare `repr` hides what the model was thinking. So the `triage` sample now prints (with `print_classification` in `decision_models/triage.py`), for every message, the chosen value of each field, its confidence, the score for the rubrics, and the probability of every option:
 
 ```text
   Message:     "I am done with everything you offer. I want to unsubscribe and you need to delete my account."
@@ -472,7 +496,7 @@ def escalate[LevelT: IntEnum](level: LevelT, probabilities: Mapping[str, float] 
     return level
 ```
 
-In `main_advanced.py`, after the decision model has answered:
+In `print_classification`, after the decision model has answered:
 
 ```python
 assessment = assess_priority(output.urgency, output.impact, result.response.provider_details)
@@ -530,7 +554,7 @@ The plain Python version has none of these problems: one request per message, th
 
 ## 10. Show the Fallback at Work with a Hand-off
 
-The demo lives in `src/main_handoff.py`. It reuses the types, messages and printing from `main_advanced.py`, which stays as it is.
+The demo is the `handoff` sample (`uv run decision-models handoff`, code in `decision_models/samples/handoff.py`). It reuses the types, messages and printing from `decision_models/triage.py`, so the `triage` sample stays as it is.
 
 In the runs so far the `FallbackModel` never did anything: every field is an enum, so `nimble` can always answer. That hides what the fallback is for. Pydantic AI pairs a decision model with a language model on purpose: the decision model answers what it can, and hands off the rest. Only the handed-off steps cost a language model call. Two kinds of hand-off exist, both subclasses of `DecisionHandOff` (itself a `ModelAPIError`, so a `FallbackModel` catches it):
 - **`UnfillableRoute`:** the model picked a route whose fields it cannot express, such as a free-form `str`.
@@ -604,11 +628,11 @@ Variant 2, `decision_route_threshold` at `0.6`. The advertorial question now goe
 - The fallback works as designed: only the step the decision model cannot take costs a cloud call. One message out of six in variant 1, two in variant 2.
 - The route pick is a decision with a probability, just like the fields. For the advertorial question `nimble` was torn (0.58 classify vs 0.42 reply), and the threshold turns that doubt into a hand-off.
 - An unsure hand-off has a price: the cloud model gives a `MessageClassification` without a distribution, so escalation and the review gate cannot run. A route threshold trades local answers with numbers for cloud answers without them. Pick it on purpose.
-- Adding a second output type also changes the context of the question. With the new instruction, the advertorial urgency moved from `MEDIUM` (in `main_advanced.py`) to `LOW`. Changing the instruction is changing the question.
+- Adding a second output type also changes the context of the question. With the new instruction, the advertorial urgency moved from `MEDIUM` (in the `triage` sample) to `LOW`. Changing the instruction is changing the question.
 
 ### Things to handle in the code
 - A step answered by the language model has no `probabilities` or `confidence` in `provider_details`. `escalate` would then keep the level as it is, and the confidence gate has nothing to check. So the output says "answered by the fallback, no distribution" instead of printing an unescalated priority as if it had been checked.
-- `result.output` is now either a `MessageClassification` or a `DraftReply`, so `main_handoff.py` uses a `match` on the type before it computes a priority.
+- `result.output` is now either a `MessageClassification` or a `DraftReply`, so the `handoff` sample uses a `match` on the type before it computes a priority.
 - The route probabilities are printed next to each message. They show how sure the model was about classifying versus answering, and help pick a sensible `decision_route_threshold`. A handed-off step has no decision model response, so the demo passes a small handler as `fallback_on` that keeps the `DecisionHandOff` and prints its route and probability.
 
 > **Image suggestion:** a flow diagram of one message: *message* → `nimble` picks a route (with probabilities) → either *classification* (answered locally → priority) or *draft reply* → `UnfillableRoute` → `gpt-6.1-sol` writes the reply. Add a dashed branch for `UnsureRoute` when the pick is below `decision_route_threshold`, and a crossed-out branch for "Ollama down", which `fallback_on=DecisionHandOff` does not send to the cloud.

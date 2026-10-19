@@ -6,8 +6,22 @@ and [Ollama](https://ollama.com/).
 
 ## Status
 
-Early boilerplate stage. The project currently only wires up configuration
-and a provider-agnostic model factory (OpenAI or Ollama) via pydantic-ai.
+A set of runnable samples that compare decision models: a yes/no guardrail
+on a local Ollama model and OpenAI `gpt-6-luna`, and a support desk triage
+with a local decision model and a cloud language model as fallback.
+
+## Running the samples
+
+```bash
+uv run decision-models                   # list the samples
+uv run decision-models guardrail         # nimble and gpt-6-luna through Pydantic AI
+uv run decision-models guardrail-openai  # the raw OpenAI Decisions SDK
+uv run decision-models triage            # support desk triage with priority
+uv run decision-models handoff           # hand-off to the fallback language model
+```
+
+`make run SAMPLE=triage` and `uv run python -m decision_models.samples.triage`
+do the same.
 
 ## Requirements
 
@@ -40,9 +54,17 @@ Settings are read from environment variables or a local `.env` file (see
 
 ```
 src/decision_models/
-├── __init__.py    # entry point
-├── settings.py     # environment-based configuration
-└── models.py        # pydantic-ai model factory (OpenAI / Ollama)
+├── __init__.py      # the decision-models command
+├── settings.py      # environment-based configuration
+├── models.py        # pydantic-ai model factory (OpenAI / Ollama)
+├── priority.py      # escalation, priority and review on top of a triage
+├── system_one.py    # System One model that rounds score answers (float noise fix)
+├── triage.py        # shared triage types, messages and printing
+└── samples/         # one module with a main() per sample
+    ├── guardrail.py
+    ├── guardrail_openai.py
+    ├── triage.py
+    └── handoff.py
 ```
 
 ## Common tasks
@@ -51,7 +73,7 @@ See the `Makefile` for available tasks:
 
 ```bash
 make install   # sync dependencies
-make run       # run the project entry point
+make run       # list the samples, or run one with SAMPLE=<name>
 make lint      # run ruff checks
 make format    # auto-format with ruff
 make test      # run the test suite

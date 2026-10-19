@@ -1,16 +1,13 @@
+"""Shared support desk triage: the output types, the sample messages and the printing of a classification."""
+
 from enum import Enum, IntEnum, StrEnum
 
-import logfire
-from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict
-from pydantic_ai import Agent, UseEnumMemberDocstrings
-from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai import UseEnumMemberDocstrings
 
 from decision_models.priority import assess_priority
-from decision_models.system_one import build_system_one_model
 
 
-# Or using Intent semantics:
 class MessageIntent(UseEnumMemberDocstrings, StrEnum):
     COMPLIMENT = "compliment"
     """A compliment is a positive remark or expression of praise or admiration."""
@@ -20,6 +17,7 @@ class MessageIntent(UseEnumMemberDocstrings, StrEnum):
 
     QUESTION = "question"
     """A question is a request for information or clarification."""
+
 
 class Urgency(UseEnumMemberDocstrings, IntEnum):
     LOW = 0
@@ -31,13 +29,15 @@ class Urgency(UseEnumMemberDocstrings, IntEnum):
     CRITICAL = 3
     """Critical urgency means that the message is a matter of life and death."""
 
+
 class Impact(UseEnumMemberDocstrings, IntEnum):
     LOW = 0
     """Low impact means that the user will stick around."""
     MEDIUM = 1
     """Medium impact means that the user might leave."""
     HIGH = 2
-    """High impact means that we can loose the user."""
+    """High impact means that we can lose the user."""
+
 
 class MessageClassification(BaseModel):
     """Classify the incoming message based on its intent, urgency, and impact."""
@@ -115,26 +115,3 @@ def print_classification(message: str, result) -> None:
     for reason in assessment.reasons:
         print(f'  {"":<12}   - {reason}')
     print()
-
-
-if __name__ == "__main__":
-    load_dotenv()
-    logfire.configure()
-    logfire.instrument_pydantic_ai()
-
-    support = Agent(
-        # Round System One score answers, otherwise float noise from Ollama fails Pydantic AI's score check.
-        FallbackModel(build_system_one_model('nimble'), 'openai:gpt-6.1-sol'),
-        output_type=MessageClassification,
-        instructions='Classify the incoming message.',
-    )
-
-    print('=' * 60)
-    print('Model: system-one:nimble, fallback openai:gpt-6.1-sol')
-    print('Instruction: Classify the incoming message.')
-    print('Questions: intent (pick one), urgency and impact (rubric)')
-    print('=' * 60)
-
-    for message in MESSAGES:
-        result = support.run_sync(message)
-        print_classification(message, result)
