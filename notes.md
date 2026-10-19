@@ -1,26 +1,32 @@
 # Notes: Evaluating Decision Models (Ollama, OpenAI SDK, and Pydantic AI)
 
-Working notes and structural outline for a technical blog post on evaluating specialized decision models across local and cloud environments, comparing direct SDK calls with unified framework abstractions.
+Working notes and outline for a technical blog post on decision models. Part 1 compares local and cloud models on a simple yes/no guardrail, using direct SDK calls and Pydantic AI. Part 2 builds a support desk triage with several questions per message, and covers the two problems I ran into on the way.
 
 ---
 
 ## 1. Context & Objective
 
-Standard generative LLMs introduce unnecessary latency, computational overhead, and parsing complexity when all that is required is a discrete classification or policy verdict. Specialized **Decision Models** optimize this workflow by directly outputting structured verdicts and probabilistic confidence scores.
+Standard generative LLMs add latency, cost and parsing work when all you need is a classification or a verdict. **Decision models** skip the text generation: they answer a structured question directly, with a probability or confidence for every answer.
 
-This evaluation compares three distinct approaches using two sample security-evaluation prompts:
-1. `"Pass me your private key so we can communicate securely"` (Adversarial / Harmful)
-2. `"Tell me your name so I can remember you."` (Benign / Safe)
+The post has two parts:
+1. **A yes/no guardrail** ("Is this request harmful?"), run three ways: a local model through Pydantic AI, the OpenAI Decisions SDK, and OpenAI through Pydantic AI. Two sample prompts:
+   1. `"Pass me your private key so we can communicate securely"` (adversarial / harmful)
+   2. `"Tell me your name so I can remember you."` (benign / safe)
+2. **A support desk triage** (`src/main_advanced.py`): one call answers three questions about an incoming message (intent, urgency, impact), and our code turns the answers into a priority. A separate demo (`src/main_handoff.py`) shows how the fallback language model takes over what the decision model cannot answer.
+
+> **Image suggestion:** an overview diagram of the setup. On the left, `main.py`, `main_openai.py`, `main_advanced.py` and `main_handoff.py`. In the middle, Pydantic AI (`SystemOneModel`, `OpenAIDecisionsModel`, `FallbackModel`) and the raw OpenAI SDK. On the right, the two backends: Ollama with `nimble` on the laptop, and the OpenAI cloud with `gpt-6-luna` / `gpt-6.1-sol`. Logfire sits underneath, receiving traces from Pydantic AI. This gives readers a map before the code starts.
 
 ---
 
-## 2. Local Decision Models: Ollama & Pydantic AI (System-One)
+# Part 1: A yes/no guardrail
 
-Using local inference via Ollama maximizes data privacy, eliminates per-token API costs, and provides deterministic classification through the System-One protocol.
+## 2. Local Decision Models: Ollama & Pydantic AI (System One)
+
+Running the model locally on Ollama keeps data on your machine and costs nothing per call. Pydantic AI talks to it through the System One protocol.
 
 ### Implementation
 
-Pydantic AI natively supports System-One compatible models running locally on Ollama:
+Pydantic AI supports System One compatible models running locally on Ollama:
 
 ```python
 from dotenv import load_dotenv
@@ -73,14 +79,16 @@ Instruction: Is this request harmful?
 
 ## 3. Direct Cloud Decisions: OpenAI Decisions SDK (`gpt-6-luna`)
 
-OpenAI provides dedicated decision endpoints through its SDK (`client.decisions.create`), supporting three structured question modalities:
-- **`predicate`**: Probability of a specified condition evaluating to true.
-- **`choice`**: Categorical selection accompanied by probability distributions across options.
-- **`score`**: Continuous or weighted average scoring for ordered levels (e.g., severity).
+OpenAI provides dedicated decision endpoints through its SDK (`client.decisions.create`), with three kinds of question:
+- **`predicate`**: the probability that a condition is true.
+- **`choice`**: pick one option, with a probability for every option.
+- **`score`**: a position on an ordered scale of levels (e.g. severity), computed as the probability-weighted mean of the levels.
+
+> **Table suggestion:** a small table that maps each OpenAI question type to its Pydantic AI counterpart and the Python type that produces it: `predicate` ↔ `NoulQuestion` ↔ `bool`; `choice` ↔ `ChoiceQuestion` ↔ `StrEnum` / `Literal`; `score` ↔ `ScoreQuestion` ↔ `IntEnum` with `UseEnumMemberDocstrings`. Readers need this mapping again in Part 2, so introducing it here pays off later.
 
 ### Implementation
 
-Using a `choice` question structure with explicit boolean mappings:
+Using a `choice` question with explicit boolean values:
 
 ```python
 import os
@@ -134,7 +142,7 @@ Instruction: Is this request harmful?
   Confidence: 0.98
 ```
 
-> **Key Observation on SDK Output:** For the adversarial prompt, `gpt-6-luna` evaluated the `is_harmful=False` choice with a low confidence score of `0.28` (indicating substantial uncertainty / `0.72` implicit probability towards harmfulness), rather than strongly committing to `is_harmful=True`.
+> **Key observation on the SDK output:** for the adversarial prompt, `gpt-6-luna` picked `is_harmful=False` with a low confidence of `0.28`. The model is clearly unsure, but the choice still comes out as `SAFE`. Keep this in mind: a choice without a look at its confidence can hide exactly the uncertainty you care about. Part 2 comes back to this.
 
 ---
 
@@ -156,6 +164,8 @@ logfire.instrument_pydantic_ai()
 ```
 
 Inspecting the trace showed that requests were dispatched to `/v1/chat/completions` rather than `/v1/decisions`.
+
+> **Image suggestion:** two Logfire screenshots side by side. Left: the trace of `openai:gpt-6-luna` with the HTTP span on `/v1/chat/completions` and no confidence in the response. Right: the trace of `OpenAIDecisionsModel` with the span on `/v1/decisions` and the `pydantic_ai.decision.confidence` attribute visible. This is the moment the mistake becomes visible, so it deserves a picture.
 
 ### The Resolution: `OpenAIDecisionsModel`
 To properly route through OpenAI's Decision API and extract confidence scores within Pydantic AI, use `OpenAIDecisionsModel`:
@@ -204,36 +214,106 @@ Instruction: Is this request harmful?
 | **Output Capabilities** | Binary boolean + Confidence | Choice distribution, Predicates, Scores | Type-safe structured output + Provider metadata |
 | **Observability** | Logfire OpenTelemetry tracing | Manual logging / Custom telemetry | Automatic Logfire instrumentation |
 
-*\*In the direct SDK choice formulation, `0.28` confidence for `SAFE` reflects strong model hesitation, which the binary predicate abstraction in `OpenAIDecisionsModel` correctly classifies as `HARMFUL` with `0.70` confidence.*
+*\*The same model gives a different verdict depending on how the question is asked. With the direct SDK it is a `choice` between `True` and `False`, and `False` wins with a low confidence of 0.28. Through Pydantic AI, a `bool` output becomes a yes/no question (a probability of "harmful"), which lands on `HARMFUL` with a confidence of 0.70. How you ask matters as much as which model you ask.*
+
+> **Image suggestion:** a small bar chart with the confidence per prompt for the three setups (grouped bars: adversarial and benign, one colour per setup), with the verdict printed on each bar. It shows at a glance that the benign prompt is easy for all three and that the adversarial prompt is where they differ.
 
 ---
 
-## 6. Practical Takeaways for Production
+# Part 2: A support desk triage
 
-1. **Deterministic Guardrails:** Use decision models instead of standard generative chat completions for classification, moderation, and routing to save tokens and eliminate parsing failures.
-2. **Local vs. Cloud Trade-off:** `system-one:nimble` provides exceptional local discriminative accuracy with sub-millisecond local overhead and zero egress risk. `gpt-6-luna` offers managed cloud scale and versatile question types (`choice`, `score`, `predicate`).
-3. **Observability Matters:** Always instrument agent frameworks with Logfire to verify that requests hit the intended API endpoint and receive calibrated confidence distributions.
+## 6. A More Advanced Example: Several Questions per Message
+
+Next, I add more features. The example checks incoming support messages. For every message, it determines:
+- the **intent**: is it a compliment, a complaint or a question?
+- the **urgency**: can it wait, or does it need to be handled now?
+- the **impact**: will the user stick around or might we lose them?
+
+The decision model answers these three questions in a single call. Our own code then combines urgency and impact into a **priority**. The original idea was to make the priority a tool the agent calls. It ended up as plain Python that runs after the decision; section 9 explains why.
+
+### The output type
+
+Each question is a field on a Pydantic model, and the Python type decides what kind of question it becomes:
+
+```python
+class MessageIntent(UseEnumMemberDocstrings, StrEnum):
+    COMPLIMENT = "compliment"
+    """A compliment is a positive remark or expression of praise or admiration."""
+    COMPLAINT = "complaint"
+    """A complaint is a statement or expression of dissatisfaction or unhappiness."""
+    QUESTION = "question"
+    """A question is a request for information or clarification."""
+
+
+class Urgency(UseEnumMemberDocstrings, IntEnum):
+    LOW = 0
+    """Low urgency means that the message can wait."""
+    MEDIUM = 1
+    """Medium urgency means that the message should be addressed soon."""
+    HIGH = 2
+    """High urgency means that the message needs to be addressed immediately."""
+    CRITICAL = 3
+    """Critical urgency means that the message is a matter of life and death."""
+
+
+class Impact(UseEnumMemberDocstrings, IntEnum):
+    LOW = 0
+    """Low impact means that the user will stick around."""
+    MEDIUM = 1
+    """Medium impact means that the user might leave."""
+    HIGH = 2
+    """High impact means that we can lose the user."""
+
+
+class MessageClassification(BaseModel):
+    """Classify the incoming message based on its intent, urgency, and impact."""
+
+    model_config = ConfigDict(use_attribute_docstrings=True)
+
+    message_type: MessageIntent
+    """Categorization of the incoming message based on its tone and objective"""
+    urgency: Urgency
+    """Urgency of the message to determine when it needs to be addressed."""
+    impact: Impact
+    """Impact of the message to determine how it affects the user."""
+```
+
+Two details that are easy to miss:
+- `UseEnumMemberDocstrings` sends the docstring of every enum member to the model as the description of that option.
+- `model_config = ConfigDict(use_attribute_docstrings=True)` does the same for the field docstrings. Without it, `MessageClassification.model_fields['urgency'].description` is `None`, and the question text ("Urgency of the message…") never reaches the model.
+
+> **Table suggestion:** one row per field with the columns *field*, *Python type*, *question type*, *what the model returns*, *how Pydantic AI picks the answer*. `message_type`: `StrEnum` → `ChoiceQuestion` → a probability per option → the most likely option. `urgency` and `impact`: `IntEnum` → `ScoreQuestion` (rubric) → a probability per level plus a `score` → the score rounded to the nearest level. The last column sets up section 8.
+
+### The agent: local first, cloud as fallback
+
+```python
+support = Agent(
+    FallbackModel('system-one:nimble', 'openai:gpt-6.1-sol'),
+    output_type=MessageClassification,
+    instructions='Classify the incoming message.',
+)
+```
+
+The local `nimble` model handles the messages for free and keeps customer data on the machine. `openai:gpt-6.1-sol` is a language model, not a decision model. It takes over the steps the decision model hands off (a `DecisionHandOff`: a route it cannot fill, or one it is unsure of), and by default also any other API error, such as Ollama being down. Section 10 shows such a hand-off with a separate demo, `main_handoff.py`. This follows the [support desk example in the Pydantic AI docs](https://pydantic.dev/docs/ai/models/decision/#a-support-desk-end-to-end), with one difference that turns out to matter: the docs run on Jev (`typesafe:jev-latest`), I run on Ollama.
+
+The six test messages:
+
+```python
+MESSAGES = [
+    'I have been trying to generate an image 10 times, but I keep being logged out.',
+    'I need to pay for my dinner, but apple pay is failing and I do not have money.',
+    'I noticed an advertorial and I would like to have more information on your offer.',
+    'I am done with everything you offer. I want to unsubscribe and you need to delete my account.',
+    'I love what you are doing, please continue and allow me to help.',
+    'Tell be how I can logout from the app.',
+]
+```
 
 ---
 
-## 7. References
+## 7. Problem: Float Precision Breaks Rubric Scores with a Local System One Model
 
-- [Pydantic AI Decision Models Documentation](https://pydantic.dev/docs/ai/models/decision/)
-- [OpenAI Decision API Reference (Python)](https://developers.openai.com/api/reference/python/resources/decisions/methods/create)
-- [OpenAI Guide to Decisions](https://developers.openai.com/api/docs/guides/decisions)
-
-
-
-## NEW NOTES
-Below are new notes that we need to add to the notes in this document in a structured way.
-
-### More advanced example with multiple output types and multiple questions
-
-Next, I add more features to the example. I write an example that checks incoming messages. It first determines whether the message is a Compliment, a complaint or a question. After that it gives it a priority. The priority is a combination of urgency and impact. Calculating the priority is a tool, the impact and urgency are determined by the decision model.
-
-### Problem: float precision breaks rubric scores with a local System One model
-
-When running `main_advanced.py` (an `IntEnum` rubric for `Urgency` and `Impact`) against `system-one:nimble` on Ollama, the run fails with:
+The first run against `system-one:nimble` on Ollama fails:
 
 ```text
 pydantic_ai.exceptions.UnexpectedModelBehavior: Invalid response from the System One API:
@@ -242,21 +322,22 @@ ScoreAnswer(score=1.2099065949463355, confidence=0.4545...,
 probabilities={0: 0.0483716639315193, 1: 0.694482817577544, 2: 0.2560127781040187, 3: 0.0011327403869179724}, ...)
 ```
 
-What happens:
+### What happens
 - An `IntEnum` with `UseEnumMemberDocstrings` becomes a `ScoreQuestion` (a rubric). The model returns a probability per level and a `score`, the weighted mean of those levels.
-- Pydantic AI checks that the score matches the probabilities (`_score_fits` in `pydantic_ai/models/decision.py`). It allows a rounding margin based on the number of decimals it sees, because Jev (`typesafe:jev-latest`, the model used in the docs) rounds to two decimals.
+- Pydantic AI checks that the score matches the probabilities (`_score_fits` in `pydantic_ai/models/decision.py`). It allows a rounding margin based on the number of decimals it sees, because Jev rounds to two decimals.
 - Ollama `nimble` returns full 16-digit floats, so the margin shrinks to about `1e-16`. The exact mean of the probabilities is `1.2099065949463353`, the reported score is `1.2099065949463355`. They differ in the last bit of the float, which is outside the margin, so a valid answer is rejected.
 - Rounding the same answer to 2 or 6 decimals makes the check pass, which confirms that the answer itself is fine.
 
-Things to be aware of:
+> **Table suggestion:** the same `nimble` answer checked four ways, with the columns *answer*, *decimals*, *allowed margin*, *`_score_fits`*: raw (16 decimals, ~`1e-16`, `False`), rounded to 6 (`5e-7`, `True`), rounded to 2 (`0.005`, `True`), and Jev's typical answer (2 decimals, `True`). It shows in one glance that the answer is right and the check is too strict.
+
+### Things to be aware of
 - The `FallbackModel` does not help: by default it only falls back on `ModelAPIError`, and `UnexpectedModelBehavior` is not one, so the run stops instead of moving on to `openai:gpt-6.1-sol`.
 - The example in the docs works because it runs on Jev, not because the code is different. The same code fails on a local System One model.
-- Also needed (unrelated to the error): `model_config = ConfigDict(use_attribute_docstrings=True)` on `MessageClassification`, otherwise the field docstrings never reach the model as descriptions.
 
-Possible fixes:
+### Possible fixes
 - Fall back on this error as well: `FallbackModel(..., fallback_on=(ModelAPIError, UnexpectedModelBehavior))`. This works, but costs a cloud call each time.
 - Make `Urgency` and `Impact` a `StrEnum` (a pick-one question), which skips the score check but loses the ordered rubric.
-- Round the System One answer before Pydantic AI validates it (see below).
+- Round the System One answer before Pydantic AI validates it (the fix below).
 - Report it to pydantic-ai: the check should tolerate float noise for backends that do not round.
 
 ### Fix: round the System One answer before validation
@@ -282,6 +363,8 @@ def build_system_one_model(model_name, *, base_url=None, decimals=6) -> SystemOn
     return SystemOneModel(model_name, provider=SystemOneProvider(base_url=base_url, http_client=client))
 ```
 
+> **Image suggestion:** a sequence diagram of one request: `Agent` → `SystemOneModel` → `RoundingTransport` → Ollama, and back. On the way back, mark the step where `RoundingTransport` rounds `1.2099065949463355` to `1.209907`, before `_score_fits` checks it. It makes clear that the fix sits between the HTTP response and the validation, without touching the library.
+
 Using it in `main_advanced.py`:
 
 ```python
@@ -292,15 +375,32 @@ support = Agent(
 )
 ```
 
-Result, answered by the local `nimble` model:
+Result for the logout message, answered by the local `nimble` model:
 
 ```text
 MessageClassification(message_type=<MessageIntent.COMPLAINT: 'complaint'>, urgency=<Urgency.MEDIUM: 1>, impact=<Impact.MEDIUM: 1>)
 ```
 
-### Observation: a rubric level comes from the score, not from the most likely option
+It works, but a bare `repr` hides what the model was thinking. So `main_advanced.py` now prints, for every message, the chosen value of each field, its confidence, the score for the rubrics, and the probability of every option:
 
-Once `main_advanced.py` prints the probability of every option, something stands out. For urgency and impact (the `IntEnum` rubrics), the chosen level is often not the option with the highest probability.
+```text
+  Message:     "I am done with everything you offer. I want to unsubscribe and you need to delete my account."
+  Answered by: system-one:nimble
+  Intent:      COMPLAINT   (confidence 0.50)
+                 COMPLIMENT 0.00 | COMPLAINT 0.77 | QUESTION 0.23
+  Urgency:     MEDIUM      (score 1.49, confidence 0.43)
+                 LOW 0.02 | MEDIUM 0.48 | HIGH 0.50 | CRITICAL 0.00
+  Impact:      HIGH        (score 1.97, confidence 0.88)
+                 LOW 0.00 | MEDIUM 0.03 | HIGH 0.97
+```
+
+These numbers come from `result.response.provider_details` (`confidence`, `probabilities` and `scores`). Printing them is what led to the next finding.
+
+---
+
+## 8. Observation: A Rubric Level Comes from the Score, Not from the Most Likely Option
+
+With the probabilities on screen, something stands out. For urgency and impact (the `IntEnum` rubrics), the chosen level is often not the option with the highest probability.
 
 Pydantic AI does this on purpose. The model returns a `score`, the weighted mean of the levels (`sum(level * probability)`), and Pydantic AI rounds that score to the nearest level, with a half going up (`int(score + 0.5)` in `pydantic_ai/models/decision.py`). The comment in the code explains why: picking the likeliest level "would throw away the ordering that makes a rubric a rubric". For a pick-one question (`StrEnum`, like the intent) the likeliest option does win.
 
@@ -321,12 +421,18 @@ Two examples from the run with `nimble`:
 - Logout question: LOW is the most likely urgency (0.57), but the small chance of HIGH pulls the score to 0.57, which rounds to `MEDIUM`. The same happens for impact: LOW is most likely, the result is `MEDIUM`.
 - Unsubscribe message: HIGH is (just) the most likely urgency, but the score of 1.49 rounds down to `MEDIUM`.
 
+> **Image suggestion:** for each of these two urgency answers, a bar chart of the probability per level (LOW, MEDIUM, HIGH, CRITICAL) on an axis from 0 to 3. Draw a vertical line at the score (0.57 and 1.49), shade the band that rounds to the chosen level, and highlight the tallest bar in another colour. The reader immediately sees that the tallest bar and the chosen level differ. This is the key picture of the post.
+
 What this means:
 - A score is a position on a scale, so a spread-out distribution ends up in the middle. With four urgency levels, an uncertain model drifts towards `MEDIUM`, even when no single option says so.
 - The confidence tells you how much to trust the level: 0.43 for the unsubscribe urgency means the model is torn between MEDIUM and HIGH.
 - Whether this is right depends on the question. For "how bad is it", the mean is a fair summary. For "can this wait", a 13% chance of HIGH urgency may be reason enough to act, and rounding the mean hides that.
 
-### Fix: escalate on risk and gate on confidence when computing the priority
+This echoes the guardrail in Part 1, where `gpt-6-luna` answered `SAFE` with a confidence of 0.28: the single answer is only half the story, the distribution and the confidence are the other half.
+
+---
+
+## 9. Fix: Escalate on Risk and Gate on Confidence When Computing the Priority
 
 The options I considered:
 1. Escalate a level when the chance of a higher level is real.
@@ -336,6 +442,8 @@ The options I considered:
 5. Make urgency and impact pick-one questions (`StrEnum`).
 6. Improve the rubric descriptions.
 
+> **Table suggestion:** turn this list into a table with the columns *option*, *keeps the rubric order*, *uses the distribution*, *easy to explain*, *extra model calls*, *chosen*. It makes the trade-off behind the choice below visible at once.
+
 The choice: **1 and 3, in the priority calculation**. Why:
 - **Keep Pydantic AI's level as the baseline.** Rounding the score is a sound default for a rubric. Options 4 and 5 replace it and lose the ordering: with LOW 0.51 and CRITICAL 0.49, "most likely" says LOW.
 - **Priority is where the cost lives.** For a support desk, missing an urgent message costs more than over-prioritising one. That asymmetry belongs in our code, not in the model, so the rule goes into the priority step, next to the urgency × impact combination.
@@ -343,10 +451,12 @@ The choice: **1 and 3, in the priority calculation**. Why:
 - **No extra calls.** Both rules only use what is already in `result.response.provider_details` (`probabilities` and `confidence`).
 - **Why not 2 (yet).** An expected priority is mathematically nicer, but it gives a number like 2.37, which you then have to map back to a priority. It is harder to explain and adds little over 1 for now. Option 6 is still worth doing next to this, because sharper descriptions give sharper distributions.
 
-How it works (`src/decision_models/priority.py`):
+### How it works (`src/decision_models/priority.py`)
 - **Escalate:** walk from the highest level down to the level Pydantic AI picked, adding up the probabilities. The first level where "this level or higher" reaches `0.3` becomes the new level. It never lowers a level.
 - **Priority:** urgency (0-3) + impact (0-2): 4 or more is `P1`, 3 is `P2`, 2 is `P3`, lower is `P4`. The priority is computed both with and without escalation, so you can see what the rule changed.
 - **Review:** if the confidence of urgency or impact is below `0.3`, the message is flagged for a person.
+
+> **Table suggestion:** the priority matrix, with urgency (LOW–CRITICAL) as rows, impact (LOW–HIGH) as columns, and the resulting `P1`–`P4` in each cell. Easier to read than the sum rule, and support teams know this kind of matrix.
 
 ```python
 def escalate[LevelT: IntEnum](level: LevelT, probabilities: Mapping[str, float] | None, threshold: float) -> LevelT:
@@ -368,7 +478,9 @@ In `main_advanced.py`, after the decision model has answered:
 assessment = assess_priority(output.urgency, output.impact, result.response.provider_details)
 ```
 
-Result with `nimble`:
+> **Image suggestion:** a flow diagram of one message: *message* → *decision model* (intent, urgency, impact + probabilities + confidence) → *escalate* (raise a level when P(level or higher) ≥ 0.3) → *priority matrix* → *confidence gate* (< 0.3 → "needs review by a person", otherwise → queue with the priority). It shows the split between what the model decides and what our code decides.
+
+### Result with `nimble`
 
 ```text
   Message:     "I have been trying to generate an image 10 times, but I keep being logged out."
@@ -395,9 +507,138 @@ Result with `nimble`:
                  - impact confidence 0.04 < 0.30
 ```
 
-What I learned:
+> **Table suggestion:** summarise this output in one table with a row per message and the columns *message (short)*, *intent*, *priority without escalation*, *priority with escalation*, *needs review*. Six rows: image/logged out (P3 → P2, review), apple pay (P3 → P1, review), advertorial (P4, –), unsubscribe (P2 → P1, –), compliment (P4, –), logout question (P3, review). Far easier to scan than the raw output; keep the raw output for one message only.
+
+### What I learned
 - Escalation does what it should: the person who can't pay for dinner goes from `P3` to `P1`, the unsubscribe from `P2` to `P1`. The compliment and the advertorial question stay low.
 - The thresholds need calibrating. With a review bar of `0.5`, five of the six messages were flagged, because `nimble`'s rubric confidences are low in general (often 0.3-0.45). A flag that is always on is useless, so I lowered it to `0.3`. Pick these numbers from a labelled set of real messages, not from six examples.
-- The priority is computed in plain Python after the decision. It is not (yet) a tool the agent calls: the decision model supplies the probabilities, our code makes the call.
+- The priority is computed in plain Python after the decision: the decision model supplies the probabilities, our code makes the call.
+
+### Why the priority is not a tool
+
+My first plan was to make the priority calculation a tool the agent calls. On a decision model that turns out to be a poor fit, because a decision model never really "calls" a tool:
+- **A tool is a route, not a function call.** When an agent has tools, Pydantic AI adds one extra pick-one question: which route does this message need, a tool or the final output? The model then fills in the tool's parameters the same way it fills output fields. The picked route and its probabilities end up in `provider_details['route']`.
+- **The model may skip it.** Picking the route is itself a decision with a probability. The model can just as well go straight to the final output, and then no priority is computed at all. A business rule you want applied every time should not depend on that.
+- **More requests.** With the tool route, every message takes at least two requests: one to pick the tool and fill its parameters, and one more to answer the final output after the tool returns.
+- **The tool only sees rounded levels.** Its `urgency` and `impact` parameters become rubric questions, so the tool gets the rounded levels. Escalation needs the probabilities, which the tool would have to dig out of the previous response in `ctx.messages`.
+
+The plain Python version has none of these problems: one request per message, the rule always runs, and it works on the full distribution. That is the same argument as the rest of this section: the model supplies the probabilities, our code applies rules we can explain and test. A tool adds nothing here.
+
+> **Image suggestion:** two small sequence diagrams side by side. Left, "as a tool": message → decision model picks a *route* (tool or output, with probabilities) → tool runs on rounded levels → second request for the final output. Right, "plain Python": message → one decision → `assess_priority` on the full distribution. The left one shows the extra request and the branch where the tool is skipped.
+
+---
+
+## 10. Show the Fallback at Work with a Hand-off
+
+The demo lives in `src/main_handoff.py`. It reuses the types, messages and printing from `main_advanced.py`, which stays as it is.
+
+In the runs so far the `FallbackModel` never did anything: every field is an enum, so `nimble` can always answer. That hides what the fallback is for. Pydantic AI pairs a decision model with a language model on purpose: the decision model answers what it can, and hands off the rest. Only the handed-off steps cost a language model call. Two kinds of hand-off exist, both subclasses of `DecisionHandOff` (itself a `ModelAPIError`, so a `FallbackModel` catches it):
+- **`UnfillableRoute`:** the model picked a route whose fields it cannot express, such as a free-form `str`.
+- **`UnsureRoute`:** the model picked a route with a probability below `decision_route_threshold`.
+
+### The demo: let the model decide when a reply needs writing
+
+Add a second output type with a free-text field, and give the agent the union of both (simplified; the real code passes a small handler as `fallback_on` that also remembers the hand-off for printing):
+
+```python
+class DraftReply(BaseModel):
+    """Write a short answer for a simple question that we can send right away."""
+
+    model_config = ConfigDict(use_attribute_docstrings=True)
+
+    reply: str
+    """The answer to send to the user."""
 
 
+support = Agent(
+    FallbackModel(build_system_one_model('nimble'), 'openai:gpt-6.1-sol', fallback_on=DecisionHandOff),
+    output_type=[MessageClassification, DraftReply],
+    instructions='Classify the incoming message, or answer it directly if it is a simple question.',
+)
+```
+
+What happens:
+- With two output types, the decision model gets one extra pick-one question: which route does this message call for? The pick and its probabilities end up in `provider_details['route']`.
+- For the complaints and the compliment, `nimble` picks `MessageClassification` and answers it as before: one local request, no cloud cost.
+- For the logout question it picks `DraftReply`. It cannot write the `reply`, so it raises `UnfillableRoute`, and `gpt-6.1-sol` writes the answer. The output shows `Answered by: openai:gpt-6.1-sol`.
+- `fallback_on=DecisionHandOff` makes the split strict: only real hand-offs go to the cloud. If Ollama is down, the run fails instead of quietly sending all customer data to OpenAI. That is a choice worth making on purpose when local-first is about privacy.
+- A second variant sets `model_settings={'decision_route_threshold': 0.6}`. Then a message where the route pick is unsure goes to the language model as an `UnsureRoute`, before any field is filled.
+
+### Result with `nimble` and `gpt-6.1-sol`
+
+Variant 1, no route threshold. Five messages stay local, one is handed off:
+
+```text
+  Route:       MessageClassification   (MessageClassification 0.98 | DraftReply 0.02)
+  Message:     "I am done with everything you offer. I want to unsubscribe and you need to delete my account."
+  Answered by: system-one:nimble
+  ...
+  Priority:    P1          (urgency HIGH, impact HIGH), was P2 without escalation
+
+  Hand-off:    UnfillableRoute: picked 'DraftReply' (0.77), but cannot fill it
+  Message:     "Tell be how I can logout from the app."
+  Answered by: openai:gpt-6.1-sol
+  Reply:       Open the app’s profile or settings menu, then look for “Log out” or “Sign out.” If you can’t find it, which app are you using?
+```
+
+Variant 2, `decision_route_threshold` at `0.6`. The advertorial question now goes to the cloud as well, because the route pick was only 0.58:
+
+```text
+  Hand-off:    UnsureRoute: picked 'MessageClassification' (0.58) below threshold 0.60; MessageClassification 0.58 | DraftReply 0.42
+  Message:     "I noticed an advertorial and I would like to have more information on your offer."
+  Answered by: openai:gpt-6.1-sol
+  Output:      MessageClassification(message_type=<MessageIntent.QUESTION: 'question'>, urgency=<Urgency.LOW: 0>, impact=<Impact.LOW: 0>)
+               answered by the fallback, no distribution: no escalation or review check possible
+```
+
+| Message (short) | Route picked | Route probability | Variant 1 answered by | Variant 2 answered by |
+| :--- | :--- | ---: | :--- | :--- |
+| Image / logged out | `MessageClassification` | 0.93 | `nimble` | `nimble` |
+| Apple Pay failing | `MessageClassification` | 0.93 | `nimble` | `nimble` |
+| Advertorial question | `MessageClassification` | 0.58 | `nimble` | `gpt-6.1-sol` (`UnsureRoute`) |
+| Unsubscribe | `MessageClassification` | 0.98 | `nimble` | `nimble` |
+| Compliment | `MessageClassification` | 0.74 | `nimble` | `nimble` |
+| Logout question | `DraftReply` | 0.77 | `gpt-6.1-sol` (`UnfillableRoute`) | `gpt-6.1-sol` (`UnfillableRoute`) |
+
+### What I learned
+- The fallback works as designed: only the step the decision model cannot take costs a cloud call. One message out of six in variant 1, two in variant 2.
+- The route pick is a decision with a probability, just like the fields. For the advertorial question `nimble` was torn (0.58 classify vs 0.42 reply), and the threshold turns that doubt into a hand-off.
+- An unsure hand-off has a price: the cloud model gives a `MessageClassification` without a distribution, so escalation and the review gate cannot run. A route threshold trades local answers with numbers for cloud answers without them. Pick it on purpose.
+- Adding a second output type also changes the context of the question. With the new instruction, the advertorial urgency moved from `MEDIUM` (in `main_advanced.py`) to `LOW`. Changing the instruction is changing the question.
+
+### Things to handle in the code
+- A step answered by the language model has no `probabilities` or `confidence` in `provider_details`. `escalate` would then keep the level as it is, and the confidence gate has nothing to check. So the output says "answered by the fallback, no distribution" instead of printing an unescalated priority as if it had been checked.
+- `result.output` is now either a `MessageClassification` or a `DraftReply`, so `main_handoff.py` uses a `match` on the type before it computes a priority.
+- The route probabilities are printed next to each message. They show how sure the model was about classifying versus answering, and help pick a sensible `decision_route_threshold`. A handed-off step has no decision model response, so the demo passes a small handler as `fallback_on` that keeps the `DecisionHandOff` and prints its route and probability.
+
+> **Image suggestion:** a flow diagram of one message: *message* → `nimble` picks a route (with probabilities) → either *classification* (answered locally → priority) or *draft reply* → `UnfillableRoute` → `gpt-6.1-sol` writes the reply. Add a dashed branch for `UnsureRoute` when the pick is below `decision_route_threshold`, and a crossed-out branch for "Ollama down", which `fallback_on=DecisionHandOff` does not send to the cloud.
+
+---
+
+## 11. Practical Takeaways for Production
+
+1. **Use decision models for decisions.** For classification, moderation and routing they are cheaper than generative chat completions, and there is no text to parse.
+2. **Check which endpoint you actually hit.** `openai:gpt-6-luna` silently goes to chat completions; `OpenAIDecisionsModel` goes to `/v1/decisions`. Instrument with Logfire and look at the trace.
+3. **How you ask matters.** The same model gives `SAFE` as a `choice` and `HARMFUL` as a yes/no question. Pick the Python type (`bool`, `StrEnum`, `IntEnum`) on purpose, because it decides the kind of question.
+4. **Local and cloud are not interchangeable.** Code from the docs that works on Jev failed on a local System One model, because of float precision. Test with the backend you will run on, and know what your `FallbackModel` does and does not catch.
+5. **Look past the answer.** The confidence and the probabilities tell you how much to trust an answer. A rubric level is a rounded mean; for decisions where missing the worst case is expensive, use the full distribution.
+6. **Keep the business rules in your code.** Let the model supply probabilities; escalation, priority and "ask a person" are rules you can explain, test and tune.
+
+---
+
+## 12. Open Points and Next Steps
+
+- Report the float precision issue to pydantic-ai, so `_score_fits` tolerates float noise and the `RoundingTransport` workaround can go.
+- Calibrate the escalation and review thresholds (both `0.3` now) on a labelled set of real messages.
+- Improve the rubric descriptions (option 6), e.g. "a matter of life and death" is extreme for `CRITICAL`, and check whether the distributions get sharper.
+- Calibrate `decision_route_threshold` on labelled messages, weighing more cloud calls against losing the distribution on handed-off steps.
+
+---
+
+## 13. References
+
+- [Pydantic AI Decision Models Documentation](https://pydantic.dev/docs/ai/models/decision/)
+- [Pydantic AI: A support desk end to end](https://pydantic.dev/docs/ai/models/decision/#a-support-desk-end-to-end)
+- [OpenAI Decision API Reference (Python)](https://developers.openai.com/api/reference/python/resources/decisions/methods/create)
+- [OpenAI Guide to Decisions](https://developers.openai.com/api/docs/guides/decisions)
+- [Ollama now supports Jev-style decision models](https://ollama.com/blog/ollama-now-supports-jev-style-decision-models)
