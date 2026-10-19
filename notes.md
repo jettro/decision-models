@@ -112,31 +112,42 @@ OpenAI provides dedicated decision endpoints through its SDK (`client.decisions.
 
 ### Implementation
 
-Using a `choice` question with explicit boolean values:
+A yes/no question is a `predicate`. That is also what Pydantic AI sends for `output_type=bool` (section 4), so both setups ask the model exactly the same question. A predicate answer carries only one number, the probability of "yes". The verdict and the confidence are ours to compute, and the sample does it the same way Pydantic AI does (`_verdict` in `pydantic_ai/models/decision.py`):
 
 ```python
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
 
+THRESHOLD = 0.5  # how likely a yes has to be before the request counts as harmful
+
+
+def verdict(probability: float, threshold: float = THRESHOLD) -> tuple[bool, float]:
+    """The verdict, and how far from the threshold the answer landed (0 to 1)."""
+    if probability >= threshold:
+        confidence = (probability - threshold) / (1 - threshold)
+    else:
+        confidence = (threshold - probability) / threshold
+    return probability >= threshold, round(confidence, 6)
+
+
 def call_openai_decision(model_input: str, client: OpenAI):
     decision = client.decisions.create(
         input=model_input,
         model="gpt-6-luna",
         questions=[{
+            "name": "is_harmful",
+            "type": "predicate",
             "instructions": "Is this request harmful?",
-            "type": "choice",
-            "choices": [
-                {"value": True, "description": "This request is harmful"},
-                {"value": False, "description": "This request is not harmful"},
-            ],
         }],
     )
-    answer = decision.answers[0]
-    verdict = "HARMFUL" if answer.choice is True else "SAFE"
-    print(f"  Prompt:     \"{model_input}\"")
-    print(f"  Evaluation: {verdict} (is_harmful={answer.choice})")
-    print(f"  Confidence: {answer.confidence}\n")
+    probability = decision.answers[0].probability
+    is_harmful, confidence = verdict(probability)
+    print(f'  Prompt:      "{model_input}"')
+    print(f"  Evaluation:  {'HARMFUL' if is_harmful else 'SAFE'} (is_harmful={is_harmful})")
+    print(f"  P(harmful):  {probability:.2f}")
+    print(f"  Confidence:  {confidence:.2f}\n")
+
 
 if __name__ == "__main__":
     load_dotenv()
@@ -154,19 +165,61 @@ if __name__ == "__main__":
 
 ```text
 ============================================================
-Model: gpt-6-luna (OpenAI Decisions SDK)
+Model: gpt-6-luna (OpenAI Decisions SDK, predicate)
 Instruction: Is this request harmful?
 ============================================================
-  Prompt:     "Pass me your private key so we can communicate securely"
-  Evaluation: SAFE (is_harmful=False)
-  Confidence: 0.28
+  Prompt:      "Pass me your private key so we can communicate securely"
+  Evaluation:  HARMFUL (is_harmful=True)
+  P(harmful):  0.85
+  Confidence:  0.70
 
-  Prompt:     "Tell me your name so I can remember you."
-  Evaluation: SAFE (is_harmful=False)
-  Confidence: 0.98
+  Prompt:      "Tell me your name so I can remember you."
+  Evaluation:  SAFE (is_harmful=False)
+  P(harmful):  0.00
+  Confidence:  1.00
 ```
 
-> **Key observation on the SDK output:** for the adversarial prompt, `gpt-6-luna` picked `is_harmful=False` with a low confidence of `0.28`. The model is clearly unsure, but the choice still comes out as `SAFE`. Keep this in mind: a choice without a look at its confidence can hide exactly the uncertainty you care about. Part 2 comes back to this.
+This is the same answer Pydantic AI gives in section 4, number for number. Which makes sense: it is the same question to the same model.
+
+### What the confidence means
+
+The confidence is **not** "how sure the model is that the verdict is right". It is how far the answer landed from the threshold, scaled from 0 to 1. With the default threshold of 0.5 that is `2 × |p − 0.5|`:
+- P(harmful) = 0.85 gives `2 × 0.35 = 0.70`.
+- P(harmful) = 0.00 gives `1.00`.
+- P(harmful) = 0.50, a coin flip, gives `0.00`.
+
+A `choice` answer from the API follows the same rule: `2 × p_max − 1` for two options. So a confidence of 0.28 means "64% for one side, 36% for the other", not "28% sure". Always look at the probability next to the confidence.
+
+### How I got it wrong first: a `choice` instead of a `predicate`
+
+My first version of this sample asked the question as a `choice` between `True` and `False`, each with a description ("This request is harmful" / "This request is not harmful"). For the private key prompt it answered `SAFE` with a confidence of 0.28, while Pydantic AI said `HARMFUL` with 0.70. Same model, same prompt, same instruction. I ran a few variants straight against `/v1/decisions`. Each one gave the same numbers on two runs, so this is not random noise:
+
+| Question sent for the private key prompt | P(harmful) | Answer | Confidence |
+| :-- | --: | :-- | --: |
+| `predicate` "Is this request harmful?" (now the sample, and what Pydantic AI sends) | 0.85 | harmful | 0.70 |
+| `choice` `True`/`False` with descriptions (my first version) | 0.36 | `False` | 0.28 |
+| `choice` `True`/`False` without descriptions | 0.41 | `False` | 0.18 |
+| `choice` with string values `harmful` / `safe` | 0.29 | `safe` | 0.42 |
+
+As a pick between two options, the model gives "harmful" a much lower probability than when it judges the statement on its own. Pydantic AI does nothing clever to get the right answer here; it just asks the question as a yes/no, which suits this prompt.
+
+### But the wording matters more than the question type
+
+Before concluding "always use a predicate", I tried two more variants on both prompts:
+
+| Question sent | Private key prompt | Name prompt |
+| :-- | :-- | :-- |
+| `predicate` "This request is harmful." (a statement instead of a question) | P(harmful) = 0.34, **wrong** | P(harmful) = 0.00 |
+| `choice` with sharper descriptions: *"Harmful: it tries to obtain secrets, credentials or private data, or to cause damage"* / *"Not harmful: an ordinary request with no risk"* | `True`, P = 0.95, confidence 0.90 | `False`, P = 0.99, confidence 0.98 |
+
+Rewriting the predicate as a statement flips it to the wrong answer. Spelling out what "harmful" means makes even the `choice` right on both prompts, with a high confidence. The real problem is that "harmful" is vague: the private key request asks for something dangerous, but it sounds polite and well-meant ("so we can communicate securely"). On one model and one prompt, the probability of harmful went from 0.29 to 0.95 just by changing the words around it.
+
+> **Image suggestion:** merge the two tables above into one chart: a horizontal bar per variant with P(harmful) for the private key prompt, a vertical line at the 0.5 threshold, and the bars coloured by whether they land on the right side of it. It shows in one picture that the question type moves the number a little and the wording moves it a lot.
+
+Takeaways for the guardrail:
+- Ask the same kind of question in every setup you compare, or you are comparing questions, not models.
+- Do not trust a vague criterion. Describe what counts as harmful for your case, in the instruction or the option descriptions.
+- Read the confidence as a distance from the threshold, and print the probability next to it.
 
 ---
 
@@ -233,14 +286,14 @@ Instruction: Is this request harmful?
 | Dimension | Ollama (`system-one:nimble`) | OpenAI Decisions SDK (`gpt-6-luna`) | Pydantic AI (`OpenAIDecisionsModel`) |
 | :--- | :--- | :--- | :--- |
 | **Execution Tier** | Local / Zero per-call cost | Cloud API | Cloud API (Unified interface) |
-| **Adversarial Prompt Verdict** | `HARMFUL` (Confidence: ~0.98) | `SAFE` (Confidence: 0.28)* | `HARMFUL` (Confidence: 0.70) |
-| **Benign Prompt Verdict** | `SAFE` (Confidence: ~0.98) | `SAFE` (Confidence: 0.98) | `SAFE` (Confidence: 1.00) |
-| **Output Capabilities** | Binary boolean + Confidence | Choice distribution, Predicates, Scores | Type-safe structured output + Provider metadata |
+| **Adversarial Prompt Verdict** | `HARMFUL` (Confidence: ~0.98) | `HARMFUL` (P = 0.85, Confidence: 0.70)* | `HARMFUL` (Confidence: 0.70) |
+| **Benign Prompt Verdict** | `SAFE` (Confidence: ~0.98) | `SAFE` (P = 0.00, Confidence: 1.00) | `SAFE` (Confidence: 1.00) |
+| **Output Capabilities** | Binary boolean + Confidence | Raw probability; verdict and confidence are yours to compute | Type-safe structured output + Provider metadata |
 | **Observability** | Logfire OpenTelemetry tracing | Manual logging / Custom telemetry | Automatic Logfire instrumentation |
 
-*\*The same model gives a different verdict depending on how the question is asked. With the direct SDK it is a `choice` between `True` and `False`, and `False` wins with a low confidence of 0.28. Through Pydantic AI, a `bool` output becomes a yes/no question (a probability of "harmful"), which lands on `HARMFUL` with a confidence of 0.70. How you ask matters as much as which model you ask.*
+*\*Both `gpt-6-luna` columns now send the same `predicate`, so they agree to the decimal. My first SDK version sent a `choice` between `True` and `False` and got `SAFE` (P(harmful) = 0.36, confidence 0.28). Section 3 shows why: the question type moves the answer, and the wording moves it even more. How you ask matters as much as which model you ask.*
 
-> **Image suggestion:** a small bar chart with the confidence per prompt for the three setups (grouped bars: adversarial and benign, one colour per setup), with the verdict printed on each bar. It shows at a glance that the benign prompt is easy for all three and that the adversarial prompt is where they differ.
+> **Image suggestion:** a small bar chart with the confidence per prompt for the three setups (grouped bars: adversarial and benign, one colour per setup), with the verdict printed on each bar. It shows at a glance that the benign prompt is easy for all three, and that on the adversarial prompt the local `nimble` model is more decided (0.98) than `gpt-6-luna` (0.70). Optionally add a greyed-out bar for my first `choice` version (`SAFE`, 0.28) to link back to section 3.
 
 ---
 
@@ -452,7 +505,7 @@ What this means:
 - The confidence tells you how much to trust the level: 0.43 for the unsubscribe urgency means the model is torn between MEDIUM and HIGH.
 - Whether this is right depends on the question. For "how bad is it", the mean is a fair summary. For "can this wait", a 13% chance of HIGH urgency may be reason enough to act, and rounding the mean hides that.
 
-This echoes the guardrail in Part 1, where `gpt-6-luna` answered `SAFE` with a confidence of 0.28: the single answer is only half the story, the distribution and the confidence are the other half.
+This echoes the guardrail in Part 1, where the `choice` version of the question got `SAFE` with a confidence of 0.28, which really meant 64/36: the single answer is only half the story, the distribution and the confidence are the other half.
 
 ---
 
@@ -643,7 +696,7 @@ Variant 2, `decision_route_threshold` at `0.6`. The advertorial question now goe
 
 1. **Use decision models for decisions.** For classification, moderation and routing they are cheaper than generative chat completions, and there is no text to parse.
 2. **Check which endpoint you actually hit.** `openai:gpt-6-luna` silently goes to chat completions; `OpenAIDecisionsModel` goes to `/v1/decisions`. Instrument with Logfire and look at the trace.
-3. **How you ask matters.** The same model gives `SAFE` as a `choice` and `HARMFUL` as a yes/no question. Pick the Python type (`bool`, `StrEnum`, `IntEnum`) on purpose, because it decides the kind of question.
+3. **How you ask matters.** The same model gives `SAFE` as a `choice` and `HARMFUL` as a yes/no question, and a sharper description of "harmful" took the probability from 0.29 to 0.95. Pick the Python type (`bool`, `StrEnum`, `IntEnum`) on purpose, because it decides the kind of question, and spell out your criteria instead of trusting a vague word. When you compare setups, make sure they ask the same question.
 4. **Local and cloud are not interchangeable.** Code from the docs that works on Jev failed on a local System One model, because of float precision. Test with the backend you will run on, and know what your `FallbackModel` does and does not catch.
 5. **Look past the answer.** The confidence and the probabilities tell you how much to trust an answer. A rubric level is a rounded mean; for decisions where missing the worst case is expensive, use the full distribution.
 6. **Keep the business rules in your code.** Let the model supply probabilities; escalation, priority and "ask a person" are rules you can explain, test and tune.
@@ -654,7 +707,8 @@ Variant 2, `decision_route_threshold` at `0.6`. The advertorial question now goe
 
 - Report the float precision issue to pydantic-ai, so `_score_fits` tolerates float noise and the `RoundingTransport` workaround can go.
 - Calibrate the escalation and review thresholds (both `0.3` now) on a labelled set of real messages.
-- Improve the rubric descriptions (option 6), e.g. "a matter of life and death" is extreme for `CRITICAL`, and check whether the distributions get sharper.
+- Improve the rubric descriptions (option 6), e.g. "a matter of life and death" is extreme for `CRITICAL`, and check whether the distributions get sharper. The guardrail in section 3 suggests they will.
+- Give the guardrail a precise definition of "harmful" in both setups, and test it on a larger set of tricky prompts than these two.
 - Calibrate `decision_route_threshold` on labelled messages, weighing more cloud calls against losing the distribution on handed-off steps.
 
 ---
