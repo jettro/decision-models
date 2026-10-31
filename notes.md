@@ -32,7 +32,6 @@ uv run decision-models handoff           # section 10: the hand-off to the langu
 src/decision_models/
     __init__.py      # the decision-models command
     priority.py      # escalation, priority and review (section 9)
-    system_one.py    # RoundingTransport and build_system_one_model (section 7)
     triage.py        # MessageIntent, Urgency, Impact, MessageClassification, MESSAGES, print_classification
     samples/
         guardrail.py, guardrail_openai.py, triage.py, handoff.py
@@ -388,9 +387,9 @@ MESSAGES = [
 
 ---
 
-## 7. Problem: Float Precision Breaks Rubric Scores with a Local System One Model
+## 7. Resolved: Float Precision in Local System One Rubric Scores
 
-The first run against `system-one:nimble` on Ollama fails:
+With Pydantic AI 2.57.0, the first run against `system-one:nimble` on Ollama failed:
 
 ```text
 pydantic_ai.exceptions.UnexpectedModelBehavior: Invalid response from the System One API:
@@ -399,7 +398,7 @@ ScoreAnswer(score=1.2099065949463355, confidence=0.4545...,
 probabilities={0: 0.0483716639315193, 1: 0.694482817577544, 2: 0.2560127781040187, 3: 0.0011327403869179724}, ...)
 ```
 
-### What happens
+### What happened before Pydantic AI 2.60.0
 - An `IntEnum` with `UseEnumMemberDocstrings` becomes a `ScoreQuestion` (a rubric). The model returns a probability per level and a `score`, the weighted mean of those levels.
 - Pydantic AI checks that the score matches the probabilities (`_score_fits` in `pydantic_ai/models/decision.py`). It allows a rounding margin based on the number of decimals it sees, because Jev rounds to two decimals.
 - Ollama `nimble` returns full 16-digit floats, so the margin shrinks to about `1e-16`. The exact mean of the probabilities is `1.2099065949463353`, the reported score is `1.2099065949463355`. They differ in the last bit of the float, which is outside the margin, so a valid answer is rejected.
@@ -407,46 +406,21 @@ probabilities={0: 0.0483716639315193, 1: 0.694482817577544, 2: 0.256012778104018
 
 > **Table suggestion:** the same `nimble` answer checked four ways, with the columns *answer*, *decimals*, *allowed margin*, *`_score_fits`*: raw (16 decimals, ~`1e-16`, `False`), rounded to 6 (`5e-7`, `True`), rounded to 2 (`0.005`, `True`), and Jev's typical answer (2 decimals, `True`). It shows in one glance that the answer is right and the check is too strict.
 
-### Things to be aware of
-- The `FallbackModel` does not help: by default it only falls back on `ModelAPIError`, and `UnexpectedModelBehavior` is not one, so the run stops instead of moving on to `openai:gpt-6.1-sol`.
-- The example in the docs works because it runs on Jev, not because the code is different. The same code fails on a local System One model.
+### Fix: use native validation in Pydantic AI 2.60.0 or later
 
-### Possible fixes
-- Fall back on this error as well: `FallbackModel(..., fallback_on=(ModelAPIError, UnexpectedModelBehavior))`. This works, but costs a cloud call each time.
-- Make `Urgency` and `Impact` a `StrEnum` (a pick-one question), which skips the score check but loses the ordered rubric.
-- Round the System One answer before Pydantic AI validates it (the fix below).
-- Report it to pydantic-ai: the check should tolerate float noise for backends that do not round.
+[Pydantic AI PR #11092](https://github.com/pydantic/pydantic-ai/pull/11092), merged on 23 October 2026, fixed this in [2.60.0](https://github.com/pydantic/pydantic-ai/releases/tag/v2.60.0). System One score validation now uses the larger of the display-rounding interval and a `1e-6` floating-point tolerance. This covers float32/float64 arithmetic noise while still rejecting inconsistent scores and distributions. Other decision providers keep their existing behavior.
 
-### Fix: round the System One answer before validation
+The project now requires Pydantic AI 2.62.0 or later, with 2.62.0 in `uv.lock`. The original workaround rounded score answers to six decimals in a custom HTTP transport. Both `RoundingTransport` and `build_system_one_model` have been removed, along with `src/decision_models/system_one.py`. The triage and handoff samples use the native `system-one:nimble` model directly, configured through `SYSTEM_ONE_BASE_URL` (and optionally `SYSTEM_ONE_API_KEY`). The native client retains the previous 600-second timeout and 5-second connect timeout.
 
-`SystemOneProvider` accepts your own `http_client`. A small httpx transport rounds the `score` and `probabilities` of every score answer in the `/v1/systemone` response to 6 decimals. Pydantic AI then sees 6 decimals, so it allows a margin of `±0.0000005` per value, which covers the float noise. Rounding this way never rejects a valid answer: the real distribution always falls inside the rounded intervals. The code is in `src/decision_models/system_one.py`:
+`tests/test_system_one.py` replays the original Ollama response above without rounding. It verifies that urgency is `MEDIUM` and that the original score and probabilities remain unchanged in provider metadata. Separate cases verify that a score off by `0.001` and a distribution summing to `1.0001` are rejected; two- and six-decimal backend responses still pass.
 
-```python
-class RoundingTransport(httpx2.AsyncBaseTransport):
-    """Transport that rounds score answers in successful `/systemone` responses."""
-
-    async def handle_async_request(self, request):
-        response = await self._transport.handle_async_request(request)
-        if not request.url.path.endswith("/systemone") or response.status_code >= 400:
-            return response
-        body = json.loads(await response.aread())
-        content = json.dumps(round_score_answers(body, self._decimals)).encode()
-        ...
-        return httpx2.Response(response.status_code, headers=headers, content=content, request=request)
-
-
-def build_system_one_model(model_name, *, base_url=None, decimals=6) -> SystemOneModel:
-    client = httpx2.AsyncClient(transport=RoundingTransport(decimals), timeout=httpx2.Timeout(600, connect=5))
-    return SystemOneModel(model_name, provider=SystemOneProvider(base_url=base_url, http_client=client))
-```
-
-> **Image suggestion:** a sequence diagram of one request: `Agent` → `SystemOneModel` → `RoundingTransport` → Ollama, and back. On the way back, mark the step where `RoundingTransport` rounds `1.2099065949463355` to `1.209907`, before `_score_fits` checks it. It makes clear that the fix sits between the HTTP response and the validation, without touching the library.
+A genuinely invalid response still raises `UnexpectedModelBehavior`, which the default `FallbackModel` does not catch. The handoff sample continues to fall back only on `DecisionHandOff`.
 
 Using it in the `triage` sample (`decision_models/samples/triage.py`):
 
 ```python
 support = Agent(
-    FallbackModel(build_system_one_model('nimble'), 'openai:gpt-6.1-sol'),
+    FallbackModel('system-one:nimble', 'openai:gpt-6.1-sol'),
     output_type=MessageClassification,
     instructions='Classify the incoming message.',
 )
@@ -628,7 +602,7 @@ class DraftReply(BaseModel):
 
 
 support = Agent(
-    FallbackModel(build_system_one_model('nimble'), 'openai:gpt-6.1-sol', fallback_on=DecisionHandOff),
+    FallbackModel('system-one:nimble', 'openai:gpt-6.1-sol', fallback_on=DecisionHandOff),
     output_type=[MessageClassification, DraftReply],
     instructions='Classify the incoming message, or answer it directly if it is a simple question.',
 )
@@ -697,7 +671,7 @@ Variant 2, `decision_route_threshold` at `0.6`. The advertorial question now goe
 1. **Use decision models for decisions.** For classification, moderation and routing they are cheaper than generative chat completions, and there is no text to parse.
 2. **Check which endpoint you actually hit.** `openai:gpt-6-luna` silently goes to chat completions; `OpenAIDecisionsModel` goes to `/v1/decisions`. Instrument with Logfire and look at the trace.
 3. **How you ask matters.** The same model gives `SAFE` as a `choice` and `HARMFUL` as a yes/no question, and a sharper description of "harmful" took the probability from 0.29 to 0.95. Pick the Python type (`bool`, `StrEnum`, `IntEnum`) on purpose, because it decides the kind of question, and spell out your criteria instead of trusting a vague word. When you compare setups, make sure they ask the same question.
-4. **Local and cloud are not interchangeable.** Code from the docs that works on Jev failed on a local System One model, because of float precision. Test with the backend you will run on, and know what your `FallbackModel` does and does not catch.
+4. **Local and cloud are not interchangeable.** Before Pydantic AI 2.60.0, code from the docs that worked on Jev failed on a local System One model because of float precision; native validation now handles this. Test with the backend you will run on, and know what your `FallbackModel` does and does not catch.
 5. **Look past the answer.** The confidence and the probabilities tell you how much to trust an answer. A rubric level is a rounded mean; for decisions where missing the worst case is expensive, use the full distribution.
 6. **Keep the business rules in your code.** Let the model supply probabilities; escalation, priority and "ask a person" are rules you can explain, test and tune.
 
@@ -705,7 +679,6 @@ Variant 2, `decision_route_threshold` at `0.6`. The advertorial question now goe
 
 ## 12. Open Points and Next Steps
 
-- Report the float precision issue to pydantic-ai, so `_score_fits` tolerates float noise and the `RoundingTransport` workaround can go.
 - Calibrate the escalation and review thresholds (both `0.3` now) on a labelled set of real messages.
 - Improve the rubric descriptions (option 6), e.g. "a matter of life and death" is extreme for `CRITICAL`, and check whether the distributions get sharper. The guardrail in section 3 suggests they will.
 - Give the guardrail a precise definition of "harmful" in both setups, and test it on a larger set of tricky prompts than these two.
@@ -715,6 +688,8 @@ Variant 2, `decision_route_threshold` at `0.6`. The advertorial question now goe
 
 ## 13. References
 
+- [Pydantic AI System One float validation fix (PR #11092)](https://github.com/pydantic/pydantic-ai/pull/11092)
+- [Pydantic AI 2.60.0 release](https://github.com/pydantic/pydantic-ai/releases/tag/v2.60.0)
 - [Pydantic AI Decision Models Documentation](https://pydantic.dev/docs/ai/models/decision/)
 - [Pydantic AI: A support desk end to end](https://pydantic.dev/docs/ai/models/decision/#a-support-desk-end-to-end)
 - [OpenAI Decision API Reference (Python)](https://developers.openai.com/api/reference/python/resources/decisions/methods/create)

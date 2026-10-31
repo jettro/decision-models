@@ -7,7 +7,6 @@ from pydantic_ai import Agent
 from pydantic_ai.models.decision import DecisionHandOff, UnfillableRoute, UnsureRoute
 from pydantic_ai.models.fallback import FallbackModel
 
-from decision_models.system_one import build_system_one_model
 from decision_models.triage import MESSAGES, MessageClassification, print_classification
 
 LANGUAGE_MODEL = 'openai:gpt-6.1-sol'
@@ -39,7 +38,7 @@ class HandOffRecorder:
 def build_agent(recorder: HandOffRecorder) -> Agent:
     return Agent(
         # Only real hand-offs go to the language model; if Ollama is down, the run fails instead.
-        FallbackModel(build_system_one_model('nimble'), LANGUAGE_MODEL, fallback_on=recorder),
+        FallbackModel('system-one:nimble', LANGUAGE_MODEL, fallback_on=recorder),
         output_type=[MessageClassification, DraftReply],
         instructions=INSTRUCTIONS,
     )
