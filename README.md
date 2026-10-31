@@ -10,6 +10,11 @@ A set of runnable samples that compare decision models: a yes/no guardrail
 on a local Ollama model and OpenAI `gpt-6-luna`, and a support desk triage
 with a local decision model and a cloud language model as fallback.
 
+The triage and handoff samples use Pydantic AI's native `system-one:nimble`
+model. Pydantic AI 2.60.0 fixed validation of full-precision scores and
+probabilities ([PR #11092](https://github.com/pydantic/pydantic-ai/pull/11092));
+this project requires 2.62.0 or later and no longer rounds HTTP responses.
+
 ## Running the samples
 
 ```bash
@@ -50,6 +55,12 @@ Settings are read from environment variables or a local `.env` file (see
 | `OPENAI_API_KEY`  | API key, required when using `openai`             | -                                |
 | `OLLAMA_BASE_URL` | Ollama's OpenAI-compatible endpoint               | `http://localhost:11434/v1`     |
 
+For the `triage` and `handoff` samples, set `SYSTEM_ONE_BASE_URL` to your
+System One endpoint, e.g. `http://localhost:11434/v1` for Ollama, and install
+the `nimble` model (`ollama pull nimble`). These samples also need
+`OPENAI_API_KEY` for their fallback language model. `SYSTEM_ONE_API_KEY` is
+optional if your System One server requires bearer authentication.
+
 ## Project layout
 
 ```
@@ -58,7 +69,6 @@ src/decision_models/
 ├── settings.py      # environment-based configuration
 ├── models.py        # pydantic-ai model factory (OpenAI / Ollama)
 ├── priority.py      # escalation, priority and review on top of a triage
-├── system_one.py    # System One model that rounds score answers (float noise fix)
 ├── triage.py        # shared triage types, messages and printing
 └── samples/         # one module with a main() per sample
     ├── guardrail.py
